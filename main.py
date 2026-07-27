@@ -5,7 +5,8 @@ Possumic RS6x/7x 毫米波雷达 HIF Host 驱动 (简化版)
 STM32MP157 Linux, SPI 模式
 
 功能:
-  - SPI 数据接收 (POLL 模式)
+  - NOTIFY IO 中断驱动接收 (gpiolib, Mode.INTERRUPT + Edge.RISING)
+  - SPI 数据接收 (spidev, POLL 模式)
   - HIF Frame 解码 (Magic/Check8/MsgHeader/Payload/Check32)
   - 分片数据自动重组 (基于 frag/more 标志)
   - 回调式 API: 注册一个回调，完整帧自动回调
@@ -32,10 +33,11 @@ MsgHeader (4B, LSB):
     def on_frame(msg_id: int, payload: bytes):
         print(f"Frame: MsgID=0x{msg_id:02X}, size={len(payload)}")
 
-    rx = RadarReceiver("/dev/spidev0.0", speed_hz=5_000_000)
+    rx = RadarReceiver("/dev/spidev0.0", speed_hz=5_000_000,
+                       notify_chip="/dev/gpiochip0", notify_line=6)
     rx.on_frame = on_frame
     rx.start()
-    # ... 数据自动到达, 完整帧自动回调 ...
+    # ... 数据自动到达, NOTIFY IO 触发后完整帧自动回调 ...
     rx.stop()
 """
 
@@ -46,6 +48,16 @@ import threading
 import logging
 from typing import Callable, Optional, Dict
 from dataclasses import dataclass
+
+# ── gpiolib 导入 (Linux 开发板已预装) ──
+try:
+    from gpiolib import GPIO as GpioLibGPIO, Mode as GpioMode, Edge as GpioEdge
+    _HAS_GPIOLIB = True
+except ImportError:
+    _HAS_GPIOLIB = False
+    GpioLibGPIO = None  # type: ignore
+    GpioMode = None      # type: ignore
+    GpioEdge = None      # type: ignore
 
 
 # ====================================================================
@@ -359,6 +371,7 @@ class RadarReceiver:
     """雷达数据接收器
 
     特性:
+      - NOTIFY IO 中断驱动: Device PA6 上升沿 → gpiolib.check() → 读取 SPI
       - 自动 HIF Frame 解析 (Magic 对齐 / Check8 / Check32)
       - 自动分片重组 (基于 frag/more 标志)
       - 单回调接口: on_frame(msg_id, payload)
@@ -366,10 +379,13 @@ class RadarReceiver:
       - 超时自动清理未完成分片
 
     用法:
-        rx = RadarReceiver("/dev/spidev0.0")
+        rx = RadarReceiver(
+            "/dev/spidev0.0", speed_hz=5_000_000,
+            notify_chip="/dev/gpiochip0", notify_line=6,
+        )
         rx.on_frame = lambda mid, data: print(f"Frame 0x{mid:02X}: {len(data)}B")
         rx.start()
-        # ... 数据自动到达 ...
+        # ... NOTIFY IO 触发后数据自动到达 ...
         rx.stop()
     """
 
@@ -377,21 +393,34 @@ class RadarReceiver:
                  spi_device: str = "/dev/spidev0.0",
                  speed_hz: int = 5_000_000,
                  spi_mode: int = 0,
+                 notify_chip: Optional[str] = None,
+                 notify_line: Optional[int] = None,
+                 notify_edge: str = "rising",
                  read_size: int = 4096,
                  frag_timeout: float = 5.0,
                  log_level: int = logging.INFO):
         """
         Args:
-            spi_device:   SPI 设备节点路径
-            speed_hz:     SPI 时钟频率 (Hz)
-            spi_mode:     SPI 模式 (0~3)
-            read_size:    每次 SPI 读取字节数
+            spi_device:   SPI 设备节点路径, 如 "/dev/spidev0.0"
+            speed_hz:     SPI 时钟频率 (Hz), 默认 5 MHz
+            spi_mode:     SPI 模式 (0~3), 默认 0
+            notify_chip:  NOTIFY IO GPIO 芯片路径, 如 "/dev/gpiochip0"
+                          None 则降级为纯 SPI 轮询模式
+            notify_line:  NOTIFY IO GPIO 引脚编号, PA6 对应 6
+            notify_edge:  边沿触发类型: "rising" / "falling" / "both"
+            read_size:    每次 SPI 读取字节数, 默认 4096
             frag_timeout: 分片重组超时 (秒), 超时后丢弃不完整数据
             log_level:    日志级别
         """
         self.spi = SpiDev(spi_device, speed_hz, spi_mode)
         self.read_size    = read_size
         self.frag_timeout = frag_timeout
+
+        # NOTIFY IO 配置
+        self._notify_chip  = notify_chip
+        self._notify_line  = notify_line
+        self._notify_edge  = notify_edge
+        self._notify_gpio: any = None  # gpiolib.GPIO 实例
 
         # 用户回调
         self._callback: Optional[FrameCallback] = None
@@ -440,15 +469,58 @@ class RadarReceiver:
     def start(self) -> bool:
         """启动接收
 
-        打开 SPI 设备, 启动后台接收线程。
+        1. 打开 SPI 设备 (spidev)
+        2. 打开 NOTIFY IO (gpiolib, INTERRUPT 模式 + 边沿触发)
+        3. 启动后台接收线程
+
         返回 True 表示成功, False 表示 SPI 打开失败。
         """
         if self._running:
             self._log.warning("Already running")
             return True
 
+        # 打开 SPI
         if not self.spi.open():
             return False
+
+        # 打开 NOTIFY IO (gpiolib INTERRUPT 模式)
+        if (self._notify_chip is not None and
+                self._notify_line is not None):
+            if not _HAS_GPIOLIB:
+                self._log.warning(
+                    "gpiolib not installed, NOTIFY IO disabled. "
+                    "Falling back to SPI polling mode."
+                )
+            else:
+                try:
+                    edge_map = {
+                        "rising":  GpioEdge.RISING,
+                        "falling": GpioEdge.FALLING,
+                        "both":    GpioEdge.BOTH,
+                    }
+                    edge = edge_map.get(
+                        self._notify_edge, GpioEdge.RISING)
+
+                    self._notify_gpio = GpioLibGPIO(
+                        chip=self._notify_chip,
+                        line=self._notify_line,
+                        mode=GpioMode.INTERRUPT,
+                        edge=edge,
+                        bias="pull_down",
+                        label="radar_notify",
+                    )
+                    self._notify_gpio.open()
+                    self._log.info(
+                        f"NOTIFY IO opened: {self._notify_chip} "
+                        f"line {self._notify_line}, "
+                        f"edge={self._notify_edge}"
+                    )
+                except Exception as e:
+                    self._log.warning(
+                        f"NOTIFY IO open failed: {e}. "
+                        f"Falling back to SPI polling mode."
+                    )
+                    self._notify_gpio = None
 
         self._running = True
         self._thread = threading.Thread(
@@ -458,14 +530,17 @@ class RadarReceiver:
         )
         self._thread.start()
 
-        self._log.info(f"Receiver started on {self.spi.device} "
-                       f"@ {self.spi.speed_hz / 1e6:.1f} MHz")
+        mode_str = "interrupt" if self._notify_gpio else "polling"
+        self._log.info(
+            f"Receiver started on {self.spi.device} "
+            f"@ {self.spi.speed_hz / 1e6:.1f} MHz ({mode_str})"
+        )
         return True
 
     def stop(self):
         """停止接收
 
-        关闭接收线程、SPI 设备, 清理统计。
+        关闭接收线程、NOTIFY IO、SPI 设备, 清理统计。
         """
         self._running = False
 
@@ -474,6 +549,16 @@ class RadarReceiver:
             self._thread.join(timeout=3.0)
         self._thread = None
 
+        # 关闭 NOTIFY IO
+        if self._notify_gpio is not None:
+            try:
+                self._notify_gpio.close()
+                self._log.info("NOTIFY IO closed")
+            except Exception as e:
+                self._log.warning(f"NOTIFY IO close error: {e}")
+            self._notify_gpio = None
+
+        # 关闭 SPI
         self.spi.close()
 
         # 清理分片
@@ -510,35 +595,46 @@ class RadarReceiver:
     def _recv_loop(self):
         """后台接收线程主循环
 
-        SPI POLL 模式:
-        - 持续从 SPI 读取数据 (dummy 字节由内核驱动产生)
-        - 在字节流中寻找 0xA5 Magic 对齐
-        - 解析完整 HIF Frame
-        - 分片重组 → 投递回调
+        中断模式 (gpiolib 可用):
+          - gpio.check(timeout=0.1) 阻塞等待 NOTIFY IO 上升沿
+          - 触发后立即读取 SPI 数据
+
+        轮询模式 (gpiolib 不可用/未配置):
+          - 持续从 SPI 读取数据 (1ms 间隔)
+
+        两种模式共享相同的帧解析/分片重组/回调投递流水线。
         """
         buf = b""
         last_cleanup = time.monotonic()
 
         while self._running:
             try:
-                # 读取 SPI 数据
+                # ── 等待数据就绪 ──
+                if self._notify_gpio is not None:
+                    # 中断模式: 阻塞等待 NOTIFY IO 上升沿
+                    has_event = self._notify_gpio.check(timeout=0.1)
+                    if not has_event:
+                        # 无事件, 继续等待
+                        continue
+                    self._log.debug("NOTIFY triggered, reading SPI...")
+                else:
+                    # 轮询模式: 短暂休眠
+                    time.sleep(0.001)
+
+                # ── 读取 SPI 数据 ──
                 chunk = self.spi.read(self.read_size)
                 if chunk:
                     self.byte_count += len(chunk)
                     buf += chunk
 
-                # 处理缓冲区中的完整帧
+                # ── 处理缓冲区中的完整帧 ──
                 buf = self._drain_frames(buf)
 
-                # 定期清理超时分片
+                # ── 定期清理超时分片 ──
                 now = time.monotonic()
                 if now - last_cleanup > 1.0:
                     self._cleanup_stale()
                     last_cleanup = now
-
-                # 无数据时短暂休眠
-                if not chunk:
-                    time.sleep(0.001)
 
             except Exception as e:
                 self._log.error(f"Recv error: {e}", exc_info=True)
@@ -741,11 +837,15 @@ if __name__ == "__main__":
     # ── 命令行参数 ──
     device  = sys.argv[1] if len(sys.argv) > 1 else "/dev/spidev0.0"
     speed   = int(sys.argv[2]) if len(sys.argv) > 2 else 5_000_000
+    gpio_chip = sys.argv[3] if len(sys.argv) > 3 else "/dev/gpiochip0"
+    gpio_line = int(sys.argv[4]) if len(sys.argv) > 4 else 6  # PA6
 
     # ── 创建接收器 ──
     rx = RadarReceiver(
         spi_device=device,
         speed_hz=speed,
+        notify_chip=gpio_chip,
+        notify_line=gpio_line,
         log_level=logging.DEBUG,
     )
     rx.on_frame = on_frame
@@ -755,6 +855,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print(f"Receiver running on {device} @ {speed/1e6:.1f} MHz")
+    print(f"NOTIFY IO: {gpio_chip} line {gpio_line}")
     print("Press Ctrl+C to stop.\n")
 
     # ── 信号处理 ──
