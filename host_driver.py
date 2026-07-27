@@ -6,7 +6,7 @@ STM32MP157 Linux, SPI 模式
 
 功能:
   - NOTIFY IO 中断驱动接收 (gpiolib, Mode.INTERRUPT + Edge.RISING)
-  - SPI 数据接收 (spidev, POLL 模式)
+  - SPI DMA 全双工传输 (spidev + SPI_IOC_MESSAGE, STM32MP157 DMA 控制器)
   - HIF Frame 解码 (Magic/Check8/MsgHeader/Payload/Check32)
   - 分片数据自动重组 (基于 frag/more 标志)
   - 回调式 API: 注册一个回调，完整帧自动回调
@@ -273,20 +273,47 @@ class FragmentAssembler:
 
 
 # ====================================================================
-#  SPI 设备操作
+#  SPI 设备操作 (DMA 模式)
 # ====================================================================
 
-class SpiDev:
-    """Linux SPI 设备操作 (基于 spidev)
+import ctypes as _ctypes
 
-    使用 /dev/spidevX.Y 和 ioctl 配置 SPI 参数。
-    POLL 模式: Host 读 MISO 数据 (发送 dummy 字节由内核处理)。
+
+class _SpiIocTransfer(_ctypes.Structure):
+    """spi_ioc_transfer 结构体 (linux/spi/spidev.h)
+
+    与内核完全一致的 C 结构体布局，ctypes 自动处理对齐。
+    """
+    _fields_ = [
+        ("tx_buf",          _ctypes.c_uint64),   # TX 缓冲区指针
+        ("rx_buf",          _ctypes.c_uint64),   # RX 缓冲区指针
+        ("len",             _ctypes.c_uint32),   # 传输长度 (字节)
+        ("speed_hz",        _ctypes.c_uint32),   # 传输速率 (0=使用默认)
+        ("delay_usecs",     _ctypes.c_uint16),   # CS 切换后延时 (us)
+        ("bits_per_word",   _ctypes.c_uint8),    # 每字位数 (0=使用默认)
+        ("cs_change",       _ctypes.c_uint8),    # 传输后是否切换 CS
+        ("tx_nbits",        _ctypes.c_uint8),    # TX 数据线数 (0=单线 SPI)
+        ("rx_nbits",        _ctypes.c_uint8),    # RX 数据线数 (0=单线 SPI)
+        ("word_delay_usecs", _ctypes.c_uint8),   # 字间延时 (us)
+        ("pad",             _ctypes.c_uint8),    # 填充字节
+    ]
+
+
+class SpiDev:
+    """Linux SPI 设备操作 (DMA 模式, 基于 spidev)
+
+    使用 SPI_IOC_MESSAGE ioctl 实现 DMA 全双工传输:
+      - STM32MP157 SPI DMA 控制器自动处理数据搬移
+      - 单次 ioctl 完成 TX+RX, 无需分离 read/write
+      - ctypes 分配缓冲区, 自动满足 DMA 对齐要求
+      - 对比 os.read/os.write 半双工模式, 效率更高
     """
 
     # ioctl 命令 (linux/spi/spidev.h)
-    _IOC_WR_MODE         = 0x40016B01
-    _IOC_WR_BITS         = 0x40016B03
-    _IOC_WR_SPEED        = 0x40046B04
+    _IOC_WR_MODE  = 0x40016B01
+    _IOC_WR_BITS  = 0x40016B03
+    _IOC_WR_SPEED = 0x40046B04
+    _IOC_MSG       = 0x40206B00   # SPI_IOC_MESSAGE(1)
 
     def __init__(self, device: str = "/dev/spidev0.0",
                  speed_hz: int = 5_000_000,
@@ -305,8 +332,10 @@ class SpiDev:
         self.bits_per_word = bits_per_word
         self._fd: Optional[int] = None
 
+    # ── 生命周期 ──────────────────────────────────────────
+
     def open(self) -> bool:
-        """打开 SPI 设备并配置"""
+        """打开 SPI 设备并配置模式/速度/字宽"""
         try:
             import fcntl
             self._fd = os.open(self.device, os.O_RDWR)
@@ -332,23 +361,78 @@ class SpiDev:
                 pass
             self._fd = None
 
-    def read(self, size: int) -> bytes:
-        """读取 SPI 数据 (POLL 模式: dummy write + MISO read)"""
+    # ── DMA 全双工传输 ────────────────────────────────────
+
+    def _transfer(self, tx_data: bytes, rx_len: int) -> bytes:
+        """DMA 全双工 SPI 传输 (核心)
+
+        通过 SPI_IOC_MESSAGE ioctl 向内核提交 spi_ioc_transfer,
+        内核自动使用 STM32MP157 SPI DMA 控制器完成数据搬移:
+          - MOSI 发送 tx_data
+          - MISO 接收 rx_len 字节
+          - 两者同时进行 (全双工)
+
+        Args:
+            tx_data: 发送数据
+            rx_len:  期望接收的字节数
+
+        Returns:
+            接收到的数据 (长度 ≤ rx_len)
+        """
         if self._fd is None:
             return b""
+
+        import fcntl
+
+        tx_len = len(tx_data)
+        total  = max(tx_len, rx_len)
+        if total == 0:
+            return b""
+
+        # 分配 DMA 对齐缓冲区 (ctypes 自动按平台要求对齐)
+        tx_buf = _ctypes.create_string_buffer(tx_data, total)
+        rx_buf = _ctypes.create_string_buffer(total)
+
+        # 构造 spi_ioc_transfer (与内核 struct 完全一致)
+        xfer = _SpiIocTransfer()
+        xfer.tx_buf        = _ctypes.addressof(tx_buf)
+        xfer.rx_buf        = _ctypes.addressof(rx_buf)
+        xfer.len           = total
+        xfer.speed_hz      = self.speed_hz
+        xfer.delay_usecs   = 0
+        xfer.bits_per_word = self.bits_per_word
+        xfer.cs_change     = 0
+        xfer.tx_nbits      = 0   # 单线 SPI
+        xfer.rx_nbits      = 0   # 单线 SPI
+        xfer.word_delay_usecs = 0
+        xfer.pad           = 0
+
         try:
-            return os.read(self._fd, size)
+            fcntl.ioctl(self._fd, self._IOC_MSG, xfer)
         except OSError:
             return b""
 
+        return bytes(rx_buf[:rx_len]) if rx_len > 0 else b""
+
+    def read(self, size: int) -> bytes:
+        """DMA 接收: 发 dummy 字节 → 读 MISO 数据
+
+        每次读取通过 SPI_IOC_MESSAGE 触发一次 DMA 传输。
+        """
+        if size <= 0:
+            return b""
+        return self._transfer(b"\x00" * size, size)
+
     def write(self, data: bytes) -> int:
-        """写入 SPI 数据"""
-        if self._fd is None:
-            return -1
-        try:
-            return os.write(self._fd, data)
-        except OSError:
-            return -1
+        """DMA 发送: 写 MOSI → 忽略 MISO 返回"""
+        if not data:
+            return 0
+        result = self._transfer(data, 0)
+        return len(data) if result is not None else -1
+
+    def transfer(self, tx_data: bytes) -> bytes:
+        """DMA 全双工: 发 tx_data, 同时收等长数据"""
+        return self._transfer(tx_data, len(tx_data))
 
     @property
     def is_open(self) -> bool:

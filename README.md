@@ -231,9 +231,12 @@ check32 = ~sum32(MsgHeader + Payload) & 0xFFFFFFFF
 
 ---
 
-### SpiDev — SPI 设备
+### SpiDev — SPI 设备 (DMA 模式)
 
-Linux spidev 封装，基于 `/dev/spidevX.Y` 和 `ioctl`。
+Linux spidev 封装，基于 `SPI_IOC_MESSAGE` ioctl 实现 DMA 全双工传输。
+
+使用 `ctypes` 分配对齐缓冲区 + `spi_ioc_transfer` 结构体，
+单次 ioctl 完成 TX+RX，内核自动使用 STM32MP157 SPI DMA 控制器搬移数据。
 
 **构造参数：**
 
@@ -250,8 +253,9 @@ Linux spidev 封装，基于 `/dev/spidevX.Y` 和 `ioctl`。
 |------|------|------|
 | `open()` | `bool` | 打开设备并配置 (mode/speed/bits)，返回是否成功 |
 | `close()` | — | 关闭设备 |
-| `read(size)` | `bytes` | POLL 模式读取 MISO 数据 |
-| `write(data)` | `int` | 写入 MOSI 数据，返回写入字节数 |
+| `read(size)` | `bytes` | DMA 接收: 发 dummy 字节 → 读 MISO |
+| `write(data)` | `int` | DMA 发送: 写 MOSI → 返回写入字节数 |
+| `transfer(tx_data)` | `bytes` | DMA 全双工: 同时收/发等长数据 |
 | `is_open` | `bool` | 设备是否已打开 |
 
 ---
