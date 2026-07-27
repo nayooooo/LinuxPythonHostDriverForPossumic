@@ -59,7 +59,8 @@ python host_driver.py /dev/spidev0.0 5000000 /dev/gpiochip0 6
 用户回调
     ↑
 RadarReceiver  ─── 后台线程, 字节流 → 帧提取 → 分片重组 → 投递
-    ├── SpiDev          ─── Linux spidev (ioctl 配置模式/速度)
+    ├── SpiDev          ─── DMA 全双工 (SPI_IOC_MESSAGE, STM32MP157 DMA)
+    │   └── _SpiIocTransfer  ─── ctypes 对齐缓冲区 + spi_ioc_transfer
     └── gpiolib.GPIO    ─── NOTIFY IO 中断 (Mode.INTERRUPT, Edge.RISING)
          ↑                        ↑
     FragmentAssembler    HifFrame / MsgHeader / check8 / check32
@@ -258,6 +259,29 @@ Linux spidev 封装，基于 `SPI_IOC_MESSAGE` ioctl 实现 DMA 全双工传输�
 | `transfer(tx_data)` | `bytes` | DMA 全双工: 同时收/发等长数据 |
 | `is_open` | `bool` | 设备是否已打开 |
 
+**内部结构体 `_SpiIocTransfer`** (ctypes, 与内核 `spi_ioc_transfer` 精确对齐):
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `tx_buf` | `c_uint64` | TX 缓冲区物理地址指针 |
+| `rx_buf` | `c_uint64` | RX 缓冲区物理地址指针 |
+| `len` | `c_uint32` | 传输字节数 |
+| `speed_hz` | `c_uint32` | 传输速率 (0=默认) |
+| `delay_usecs` | `c_uint16` | CS 切换后延时 (us) |
+| `bits_per_word` | `c_uint8` | 每字位数 |
+| `cs_change` | `c_uint8` | 传输后切换 CS |
+| `tx_nbits` | `c_uint8` | TX 数据线数 (0=单线) |
+| `rx_nbits` | `c_uint8` | RX 数据线数 (0=单线) |
+| `word_delay_usecs` | `c_uint8` | 字间延时 |
+| `pad` | `c_uint8` | 填充 |
+
+**内部方法 `_transfer(tx_data, rx_len)`** — 核心 DMA 传输:
+
+1. `ctypes.create_string_buffer()` 分配对齐缓冲区
+2. 填充 `_SpiIocTransfer` 结构体 (tx_buf/rx_buf 写入物理地址)
+3. `fcntl.ioctl(fd, SPI_IOC_MESSAGE, xfer)` 提交到内核 → DMA 传输
+4. 返回 `bytes(rx_buf[:rx_len])`
+
 ---
 
 ### RadarReceiver — 雷达接收器
@@ -435,9 +459,12 @@ def on_frame(msg_id, payload):
 
 ## 依赖
 
-- **Linux**: `/dev/spidevX.Y`, `fcntl`
-- **gpiolib** (可选): NOTIFY IO 中断模式，基于 `python-periphery`
-- **Python**: ≥ 3.7, 标准库仅 `os/struct/time/threading/logging`
+| 依赖 | 用途 | 必需 |
+|------|------|------|
+| Linux `/dev/spidevX.Y` + `fcntl` | SPI DMA 全双工传输 | 是 |
+| Python `ctypes` (标准库) | DMA 对齐缓冲区 + spi_ioc_transfer 结构体 | 是 |
+| `gpiolib` (基于 `python-periphery`) | NOTIFY IO 中断模式 | 否 (降级为轮询) |
+| Python ≥ 3.7 | 标准库 `os/struct/time/threading/logging` | 是 |
 
 ---
 
@@ -445,9 +472,10 @@ def on_frame(msg_id, payload):
 
 ```
 .
-├── host_driver.py          ← 核心驱动 (单文件)
+├── host_driver.py          ← 核心驱动 (单文件, ~900 行)
 ├── example/
-│   ├── basic_receive.py    ← 基础接收示例
-│   └── parse_reports.py    ← Report 解析示例
+│   ├── basic_receive.py    ← 基础接收: 注册回调 + 实时统计
+│   └── parse_reports.py    ← Report 解析: C1/C2/C3/C6 自动分派
+├── .gitignore              ← __pycache__/ *.pyc
 └── README.md               ← 本文档
 ```
