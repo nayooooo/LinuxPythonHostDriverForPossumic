@@ -53,3 +53,7 @@ main.py          — 示例入口
 - Report: 0xC1(C1 FFT), 0xC2(C2 FFT), 0xC3(Points), 0xC6(PSIC Debug)
 - Check32 = ~sum32(MsgHeader + Payload) DWORD aligned
 - SPI POLL 模式: Host 发 Dummy 字节读取 Device 数据
+
+## Git 提交约定
+- 每次修改文件内容后，必须通过 git 提交
+- 提交信息格式: `[YYYY-MM-DD HH:MM:SS] 修改内容描述`
