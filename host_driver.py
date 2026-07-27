@@ -28,7 +28,7 @@ MsgHeader (4B, LSB):
     - Frag:   0=末片/完整帧, 1=还有更多分片
 
 用法:
-    from main import RadarReceiver
+    from host_driver import RadarReceiver
 
     def on_frame(msg_id: int, payload: bytes):
         print(f"Frame: MsgID=0x{msg_id:02X}, size={len(payload)}")
